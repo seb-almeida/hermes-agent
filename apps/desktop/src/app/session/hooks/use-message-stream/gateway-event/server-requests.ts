@@ -73,26 +73,37 @@ type PreviewSessionRoute = 'ignore' | 'retry' | 'run'
  */
 const WINDOW_OWNED_REQUESTS = new Set(['preview.act', 'preview.read', 'terminal.read', 'window.read', 'tour'])
 
-/**
- * This window hosts the session: the primary view, an open session tile, or
- * (identity-tolerantly) a window showing the conversation under another id.
- *
- * The strict runtime-id checks alone strand real states (#121609): the HUD
- * shows the conversation but never holds it active (main holds the id on its
- * behalf — hud-shell.tsx), and after the HUD hands the session back the app
- * window's active id can still name the pre-handoff runtime until a resume
- * re-binds it. In both, every attached window ignored the request and the
- * tool stalled its full 30s deadline; only an explicit session resume fixed
- * it. So alongside the strict checks, the asked id may resolve to a
- * conversation this window SHOWS: the selected stored session or a tile's
- * stored session, matched through lineageAliases (compression rotates the
- * runtime tip under the stored identity) and the session-state cache, which
- * records which stored id each runtime id maps to. Without evidence of a
- * shown conversation — no selection, no tile, no state mapping — nothing is
- * claimed, exactly as before.
- */
+/** This window hosts the session: it is the primary view or an open session tile. */
 export function windowHostsSession(sessionId: string, activeSessionId: null | string): boolean {
-  if (sessionId === activeSessionId || $sessionTiles.get().some(tile => tile.runtimeId === sessionId)) {
+  return sessionId === activeSessionId || $sessionTiles.get().some(tile => tile.runtimeId === sessionId)
+}
+
+/**
+ * The window.read claim. window.read has no per-window pane, but its answer is
+ * keyed to the ANSWERING window's bounds — "below" is measured from them — so
+ * the only window that may answer is one showing the conversation. The strict
+ * host check strands real states (#121609): the HUD shows the conversation
+ * without holding it active (main holds the id on its behalf — hud-shell.tsx),
+ * and after the HUD hands the conversation back the app window's active id
+ * still names the pre-handoff runtime until a resume re-binds it (verified
+ * live: only an explicit session resume restored the answer). So beyond the
+ * strict checks, the asked id may resolve to a conversation this window
+ * SHOWS: the selected stored session or a tile's stored session, matched
+ * through lineageAliases (compression rotates the runtime tip under the
+ * stored identity) and the session-state cache, which records which stored id
+ * each runtime id maps to — an entry's stored id is what this window observed
+ * for that runtime, so a stale entry still maps within its own conversation.
+ * No shown conversation — nothing claimed, as before.
+ *
+ * Scoped to window.read only. preview.act and tour refuse unless
+ * isActiveSession (raw id equality), so a tolerated claim there would turn
+ * another window's silence into a false refusal that wins the multi-window
+ * race — and a tour refusal latches session["tour_bridge"] = "answered",
+ * converting every later tour action in the session into a full 45s wait.
+ * Pane-owned reads keep #113348's owner-waiting semantics.
+ */
+export function windowReadClaimsSession(sessionId: string, activeSessionId: null | string): boolean {
+  if (windowHostsSession(sessionId, activeSessionId)) {
     return true
   }
 
@@ -122,14 +133,20 @@ export function windowHostsSession(sessionId: string, activeSessionId: null | st
  */
 export function previewSessionRoute({
   activeSessionId,
+  method,
   replayed,
   sessionId
 }: {
   activeSessionId: null | string
+  method?: string
   replayed: boolean | undefined
   sessionId: string
 }): PreviewSessionRoute {
-  if (!sessionId || windowHostsSession(sessionId, activeSessionId)) {
+  if (!sessionId) {
+    return 'run'
+  }
+
+  if (method === 'window.read' ? windowReadClaimsSession(sessionId, activeSessionId) : windowHostsSession(sessionId, activeSessionId)) {
     return 'run'
   }
 
@@ -522,18 +539,20 @@ export function handleServerRequest(
   const sessionId = str(request.params.session_id)
 
   if (WINDOW_OWNED_REQUESTS.has(request.method)) {
-    const route = previewSessionRoute({ activeSessionId, replayed: request.replayed, sessionId })
+    // Route window.read through the tolerant claim (see windowReadClaimsSession);
+    // every other window-owned request keeps the strict host check.
+    const route = previewSessionRoute({
+      activeSessionId,
+      method: request.method,
+      replayed: request.replayed,
+      sessionId
+    })
 
     if (route === 'ignore') {
-      // window.read has no per-window pane — any attached window could
-      // enumerate, and one that ignored the request would otherwise stall the
-      // agent for the full deadline (#121609: no window claimed the session).
-      // The other pane-owned reads keep #113348's owner-waiting semantics: an
-      // empty answer here would beat the owner's real pane in the race.
-      if (request.method === 'window.read') {
-        answerValue(request, null)
-      }
-
+      // Deliberately silent, per #113348: resolve_response keeps the FIRST
+      // response and drops the rest, so a fast empty or wrong-geometry answer
+      // from a non-claiming window could beat the claimant's real answer in
+      // the fanout race. Silence is what lets the owner win.
       return true
     }
 

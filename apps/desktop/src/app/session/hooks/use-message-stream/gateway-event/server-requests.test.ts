@@ -100,7 +100,11 @@ describe('preview action request routing', () => {
   })
 
   it('leaves scoped pane reads unanswered in a window showing another session', async () => {
-    const reads = ['preview.read', 'terminal.read'].map(method =>
+    // Silence is load-bearing even for window.read: resolve_response keeps the
+    // FIRST response and drops the rest, so a fast empty answer from a
+    // non-claiming window could beat the claimant's real answer in the fanout
+    // race (review of #121715).
+    const reads = ['preview.read', 'terminal.read', 'window.read'].map(method =>
       deliver(method, { session_id: 'session-a' }, 'session-b')
     )
 
@@ -110,18 +114,6 @@ describe('preview action request routing', () => {
       expect(handled).toBe(true)
       expect(respond).not.toHaveBeenCalled()
     }
-  })
-
-  it('answers window.read empty instead of stalling when no window claims the session (#121609)', async () => {
-    // window.read has no per-window pane: an unclaimed request used to wait
-    // out the tool's full 30s deadline because silence was the "not mine"
-    // signal. Pane-owned reads still wait for their owner (#113348).
-    const { handled, respond } = deliver('window.read', { session_id: 'session-a' }, 'session-b')
-
-    await Promise.resolve()
-
-    expect(handled).toBe(true)
-    expect(respond).toHaveBeenCalledWith({ value: '' })
   })
 
   it("answers pane reads for a session hosted in one of this window's tiles", async () => {
@@ -172,10 +164,10 @@ describe('window.read claim tolerance (#121609)', () => {
     // window has the conversation selected and its runtime id lineage-maps.
     setSelectedStoredSessionId('stored-a')
 
-    expect(previewSessionRoute({ activeSessionId: 'runtime-x', replayed: false, sessionId: 'root-a' })).toBe('run')
-    expect(previewSessionRoute({ activeSessionId: null, replayed: false, sessionId: 'root-a' })).toBe('run')
+    expect(previewSessionRoute({ activeSessionId: 'runtime-x', method: 'window.read', replayed: false, sessionId: 'root-a' })).toBe('run')
+    expect(previewSessionRoute({ activeSessionId: null, method: 'window.read', replayed: false, sessionId: 'root-a' })).toBe('run')
     // Plain stored-id ask (no rotation): selected matches directly.
-    expect(previewSessionRoute({ activeSessionId: 'runtime-x', replayed: false, sessionId: 'stored-a' })).toBe('run')
+    expect(previewSessionRoute({ activeSessionId: 'runtime-x', method: 'window.read', replayed: false, sessionId: 'stored-a' })).toBe('run')
   })
 
   it('maps an unknown runtime id through the session-state cache to the shown conversation', () => {
@@ -184,27 +176,40 @@ describe('window.read claim tolerance (#121609)', () => {
     setSelectedStoredSessionId('stored-a')
     $sessionStates.set({ 'runtime-rotated': createClientSessionState('stored-a') })
 
-    expect(previewSessionRoute({ activeSessionId: 'runtime-rotated', replayed: false, sessionId: 'runtime-rotated' })).toBe('run')
+    expect(previewSessionRoute({ activeSessionId: 'runtime-rotated', method: 'window.read', replayed: false, sessionId: 'runtime-rotated' })).toBe('run')
   })
 
   it('claims for a tile whose stored session lineage-matches the asked id', () => {
     $sessionTiles.set([{ runtimeId: 'tile-runtime', storedSessionId: 'stored-a' } as never])
 
-    expect(previewSessionRoute({ activeSessionId: 'session-b', replayed: false, sessionId: 'root-a' })).toBe('run')
-    expect(previewSessionRoute({ activeSessionId: 'session-b', replayed: false, sessionId: 'stored-a' })).toBe('run')
+    expect(previewSessionRoute({ activeSessionId: 'session-b', method: 'window.read', replayed: false, sessionId: 'root-a' })).toBe('run')
+    expect(previewSessionRoute({ activeSessionId: 'session-b', method: 'window.read', replayed: false, sessionId: 'stored-a' })).toBe('run')
+  })
+
+  it('keeps every other window-owned method on the strict host check even when the identity is tolerated', () => {
+    // preview.act and tour refuse on raw isActiveSession, so widening their
+    // claim would turn another window's silence into a false refusal that
+    // wins the race — and a tour refusal latches session["tour_bridge"],
+    // converting later tour actions into 45s waits (review of #121715).
+    setSelectedStoredSessionId('stored-a')
+
+    expect(previewSessionRoute({ activeSessionId: 'runtime-x', method: 'preview.read', replayed: false, sessionId: 'root-a' })).toBe('ignore')
+    expect(previewSessionRoute({ activeSessionId: 'runtime-x', method: 'terminal.read', replayed: false, sessionId: 'root-a' })).toBe('ignore')
+    expect(previewSessionRoute({ activeSessionId: 'runtime-x', method: 'preview.act', replayed: false, sessionId: 'root-a' })).toBe('ignore')
+    expect(previewSessionRoute({ activeSessionId: 'runtime-x', method: 'tour', replayed: false, sessionId: 'root-a' })).toBe('ignore')
   })
 
   it('never claims a conversation this window does not show', () => {
     setSelectedStoredSessionId('stored-a')
 
-    expect(previewSessionRoute({ activeSessionId: 'session-b', replayed: false, sessionId: 'session-unrelated' })).toBe('ignore')
-    expect(previewSessionRoute({ activeSessionId: 'session-b', replayed: false, sessionId: 'root-other' })).toBe('ignore')
+    expect(previewSessionRoute({ activeSessionId: 'session-b', method: 'window.read', replayed: false, sessionId: 'session-unrelated' })).toBe('ignore')
+    expect(previewSessionRoute({ activeSessionId: 'session-b', method: 'window.read', replayed: false, sessionId: 'root-other' })).toBe('ignore')
   })
 
   it('claims nothing without a shown conversation — a background session stays unclaimed', () => {
     // No selection, no tiles: the tolerant branch must stay inert so a window
     // midsession cannot answer for a background conversation it never showed.
-    expect(previewSessionRoute({ activeSessionId: 'session-b', replayed: false, sessionId: 'root-a' })).toBe('ignore')
+    expect(previewSessionRoute({ activeSessionId: 'session-b', method: 'window.read', replayed: false, sessionId: 'root-a' })).toBe('ignore')
   })
 
   it('lets a shown-conversation window answer a window.read end to end without a resume', async () => {
